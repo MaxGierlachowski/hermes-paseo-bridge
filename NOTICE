@@ -1,0 +1,13 @@
+hermes-paseo-bridge
+Copyright 2026 Max Gierlachowski
+
+This plugin contains no third-party code. It runs inside Hermes Agent
+(https://github.com/NousResearch/hermes-agent) and uses only its public
+plugin API plus the Python standard library. It receives webhooks from
+paseo-mcp (https://github.com/MaxGierlachowski/paseo-mcp) for Paseo
+(https://paseo.sh). The Standard Webhooks signature scheme is specified at
+https://www.standardwebhooks.com; the test vector in tests/test_signature.py
+is taken from that specification.
+
+Hermes, Paseo and Claude are names of their respective owners. This project is
+not affiliated with or endorsed by Nous Research or the Paseo authors.
