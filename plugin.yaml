@@ -11,21 +11,25 @@ provides_hooks:
   - pre_tool_call
   - post_compaction
 config_schema:
-  listen_host: {type: str, default: "127.0.0.1", description: "Address the event receiver binds to"}
+  listen_host: {type: str, default: "127.0.0.1", description: "Loopback address the webhook receiver binds to (non-loopback is refused)"}
   listen_port: {type: int, default: 8645, description: "Port of the event receiver"}
   path: {type: str, default: "/paseo/events", description: "URL path paseo-mcp posts to"}
-  secret_env: {type: str, default: "HERMES_PASEO_BRIDGE_SECRET", description: "Environment variable holding the webhook secret"}
+  secret_env: {type: str, default: "HERMES_PASEO_BRIDGE_SECRET", description: "Environment variable holding the webhook secret (unset: no receiver)"}
   signature: {type: str, default: "standard-webhooks", description: "standard-webhooks or paseo"}
-  listener: {type: str, default: "auto", description: "auto (start once a gateway or TUI host is live), always, never"}
+  paseo_mcp_url: {type: str, default: "", description: "paseo-mcp Streamable HTTP endpoint for long-poll intake, e.g. http://127.0.0.1:<port>/mcp (empty: off)"}
+  paseo_mcp_token_env: {type: str, default: "HERMES_PASEO_BRIDGE_PASEO_MCP_TOKEN", description: "Environment variable holding the paseo-mcp read token"}
+  poll_timeout_seconds: {type: int, default: 25, description: "How long one paseo_wait_for_events call waits"}
+  listener: {type: str, default: "auto", description: "auto (start intake once a gateway or TUI host is live), always, never"}
   tools: {type: list, default: ["mcp__*__paseo_create_agent"], description: "Tool names (globs) whose calls get the session labels"}
+  steer_tools: {type: list, default: ["mcp__*__paseo_send_message"], description: "Tool names (globs) whose agent_id then reports to the calling session"}
   label_prefix: {type: str, default: "hermes_", description: "Prefix of the labels the bridge sets"}
   extra_labels: {type: dict, default: {origin_ref: session_id, hermes_chat_id: chat_id, hermes_thread_id: thread_id}, description: "More labels, filled only when empty: label -> session_key|session_id|profile|platform|chat_id|thread_id"}
   filter_labels: {type: dict, default: {origin: hermes}, description: "Only events of agents with all these labels"}
-  event_types: {type: list, default: [agent.turn_ended, agent.permission_requested], description: "Event types that start a turn"}
-  turn_outcomes: {type: list, default: [finished, error], description: "turn_ended outcomes that start a turn"}
+  event_types: {type: list, default: [agent.turn_ended, agent.permission_requested, agent.closed], description: "Event types that start a turn (agent.turn_started never does)"}
+  turn_outcomes: {type: list, default: [finished, error, limit], description: "turn_ended outcomes that start a turn"}
   coalesce_seconds: {type: float, default: 5, description: "Wait this long after an event for more of the same session"}
   max_turns_per_minute: {type: int, default: 6, description: "Injected turns per session and minute; more events wait and are merged"}
   preview_chars: {type: int, default: 600, description: "Characters of the agent's last message shown in the turn"}
   instructions: {type: str, description: "Closing line of every injected message"}
   retention_hours: {type: float, default: 72, description: "How long delivery ids and handled events are kept for deduplication"}
-  fallback: {type: dict, default: {mode: log}, description: "mode log|forward|session; forward: url, secret_env, signature; session: session_key"}
+  fallback: {type: dict, default: {mode: home}, description: "mode home|log|forward|session; home: platform; forward: url, secret_env, signature; session: session_key"}

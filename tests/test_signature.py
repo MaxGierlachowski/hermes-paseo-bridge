@@ -2,6 +2,7 @@ import base64
 import unittest
 
 import helpers  # noqa: F401  (sys.path)
+
 from paseo_bridge import signature
 
 BODY = b'{"type":"agent.turn_ended"}'

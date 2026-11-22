@@ -1,7 +1,8 @@
 import unittest
 
 import helpers
-from paseo_bridge.config import SettingsError, load_settings
+
+from paseo_bridge.config import SettingsError, load_settings, with_env
 from paseo_bridge.labels import SessionRef, bridge_labels, tool_matches
 
 
@@ -55,7 +56,11 @@ class ConfigTest(unittest.TestCase):
         s = load_settings(lambda k, d: d)
         self.assertEqual(s.listen_port, 8645)
         self.assertEqual(s.filter_labels, {"origin": "hermes"})
-        self.assertEqual(s.fallback.mode, "log")
+        self.assertEqual(s.fallback.mode, "home")
+        self.assertEqual(s.event_types, ("agent.turn_ended", "agent.permission_requested", "agent.closed"))
+        self.assertEqual(s.turn_outcomes, ("finished", "error", "limit"))
+        self.assertEqual(s.steer_tools, ("mcp__*__paseo_send_message",))
+        self.assertEqual(s.paseo_mcp_url, "")
 
     def test_overrides(self):
         cfg = {"listen_port": 9000, "event_types": ["agent.turn_ended"], "fallback": {"mode": "session", "session_key": "agent:main:slack:dm:T:D"}}
@@ -67,9 +72,36 @@ class ConfigTest(unittest.TestCase):
     def test_invalid(self):
         for cfg in ({"fallback": {"mode": "forward"}}, {"fallback": {"mode": "session"}}, {"signature": "github"},
                     {"listen_port": "x"}, {"path": "no-slash"}, {"tools": [""]}, {"filter_labels": {"a": 1}},
-                    {"max_turns_per_minute": 0}):
+                    {"max_turns_per_minute": 0}, {"listen_host": "0.0.0.0"}, {"listen_host": "192.168.1.5"},
+                    {"paseo_mcp_url": "ftp://x"}, {"fallback": {"mode": "carrier-pigeon"}}):
             with self.subTest(cfg=cfg), self.assertRaises(SettingsError):
                 load_settings(lambda k, d, cfg=cfg: cfg.get(k, d))
+
+    def test_loopback_hosts_accepted(self):
+        for host in ("127.0.0.1", "127.0.0.2", "::1", "localhost"):
+            with self.subTest(host=host):
+                self.assertEqual(load_settings(lambda k, d, h=host: h if k == "listen_host" else d).listen_host, host)
+
+    def test_env_overrides_win_over_config(self):
+        cfg = {"listen_port": 9000, "fallback": {"mode": "log"}, "tools": ["a"]}
+        env = {"HERMES_PASEO_BRIDGE_LISTEN_PORT": "8700", "HERMES_PASEO_BRIDGE_PASEO_MCP_URL": "http://127.0.0.1:6768/mcp",
+               "HERMES_PASEO_BRIDGE_FALLBACK_MODE": "session", "HERMES_PASEO_BRIDGE_FALLBACK_SESSION_KEY": "agent:main:x",
+               "HERMES_PASEO_BRIDGE_FILTER_LABELS": '{"origin": "box"}', "HERMES_PASEO_BRIDGE_STEER_TOOLS": "x,y",
+               "HERMES_PASEO_BRIDGE_COALESCE_SECONDS": "2.5", "HERMES_PASEO_BRIDGE_LISTEN_HOST": ""}
+        s = load_settings(with_env(lambda k, d: cfg.get(k, d), env))
+        self.assertEqual(s.listen_port, 8700)
+        self.assertEqual(s.listen_host, "127.0.0.1")  # empty variable = not set
+        self.assertEqual(s.paseo_mcp_url, "http://127.0.0.1:6768/mcp")
+        self.assertEqual((s.fallback.mode, s.fallback.session_key), ("session", "agent:main:x"))
+        self.assertEqual(s.filter_labels, {"origin": "box"})
+        self.assertEqual(s.steer_tools, ("x", "y"))
+        self.assertEqual(s.tools, ("a",))
+        self.assertEqual(s.coalesce_seconds, 2.5)
+        with self.assertRaises(SettingsError):
+            load_settings(with_env(lambda k, d: d, {"HERMES_PASEO_BRIDGE_LISTEN_PORT": "many"}))
+
+    def test_steer_tools_can_be_switched_off(self):
+        self.assertEqual(load_settings(lambda k, d: [] if k == "steer_tools" else d).steer_tools, ())
 
 
 if __name__ == "__main__":

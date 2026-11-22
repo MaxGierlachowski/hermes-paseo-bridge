@@ -11,7 +11,7 @@ import binascii
 import hashlib
 import hmac
 import time
-from typing import Mapping
+from collections.abc import Mapping
 
 
 def _header(headers: Mapping[str, str], name: str) -> str:

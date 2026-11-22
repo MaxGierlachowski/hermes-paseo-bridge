@@ -4,6 +4,7 @@ import unittest
 
 import helpers
 from helpers import Clock, FakeInjector, delivery, event
+
 from paseo_bridge.config import FallbackSettings
 from paseo_bridge.dispatcher import Dispatcher, Fallback
 from paseo_bridge.store import FALLBACK, INJECTED, PENDING, SKIPPED, Store
@@ -47,6 +48,55 @@ class FilterTest(Base):
         d = self.make(filter_labels={"origin": "hermes", "team": "ops"}, event_types=("agent.turn_ended",))
         res = d.submit("d1", delivery(event(1), event(2, labels={"origin": "hermes", "team": "ops", "hermes_session_key": KEY})))
         self.assertEqual(res["queued"], 1)
+
+
+    def test_turn_started_is_never_delivered(self):
+        d = self.make(event_types=("agent.turn_started", "agent.turn_ended"))
+        res = d.submit("d1", delivery(event(1, type_="agent.turn_started")))
+        self.assertEqual(res["queued"], 0)
+        self.assertEqual(self.store.status_of("evt:ep1:1")[0], SKIPPED)
+
+    def test_limit_and_closed_are_delivered_by_default(self):
+        d = self.make()
+        res = d.submit("d1", delivery(event(1, outcome="limit", error="usage limit"), event(2, type_="agent.closed", agent="agent-2")))
+        self.assertEqual(res["queued"], 2)
+        self.run_until_idle(10)
+        self.assertEqual(len(self.inject.calls), 1)
+        text = self.inject.calls[0][1]
+        self.assertIn("hit a limit", text)
+        self.assertIn("agent-2) was closed", text)
+
+
+class RouteTest(Base):
+    def test_steered_agent_reports_to_the_steering_session(self):
+        d = self.make()
+        self.store.set_route("agent-9", "agent:main:local:dm:ui-7", "default")
+        # Started in the Paseo app: no hermes labels at all, yet the steering session waits for it.
+        d.submit("d1", delivery(event(1, agent="agent-9", labels={})))
+        # A route also wins over the session label of the agent's creator.
+        self.store.set_route("agent-1", "agent:main:local:dm:ui-7", "default")
+        d.submit("d2", delivery(event(2, agent="agent-1")))
+        self.run_until_idle(10)
+        self.assertEqual([c[0] for c in self.inject.calls], ["agent:main:local:dm:ui-7"])
+        self.assertIn("agent-9", self.inject.calls[0][1])
+        self.assertIn("agent-1", self.inject.calls[0][1])
+
+    def test_route_by_id_prefix(self):
+        self.make()
+        self.store.set_route("a1b2c3d4", "agent:main:local:dm:ui-1", "default")
+        self.store.set_route("a1b2", "agent:main:local:dm:too-short", "default")
+        self.assertEqual(self.store.route("a1b2c3d4-0000-full-id"), ("agent:main:local:dm:ui-1", "default"))
+        self.assertIsNone(self.store.route("ffff0000-other"))
+        self.store.set_route("a1b2c3d4-0000-full-id", "agent:main:local:dm:ui-2", "default")
+        self.assertEqual(self.store.route("a1b2c3d4-0000-full-id")[0], "agent:main:local:dm:ui-2")
+
+    def test_route_of_another_profile_goes_to_fallback(self):
+        d = self.make()
+        self.store.set_route("agent-9", "agent:data:local:dm:x", "data")
+        d.submit("d1", delivery(event(1, agent="agent-9", labels={})))
+        self.run_until_idle(10)
+        self.assertEqual(self.inject.calls, [])
+        self.assertIn("profile data", self.store.status_of("evt:ep1:1")[1])
 
 
 class InjectTest(Base):
@@ -214,6 +264,51 @@ class FallbackTest(Base):
         status, reason = self.store.status_of("evt:ep1:2")
         self.assertEqual(status, FALLBACK)
         self.assertIn("forward failed", reason)
+
+
+class HomeFallbackTest(Base):
+    def make_home(self, result):
+        calls = []
+
+        def inject_home(platform, text):
+            calls.append((platform, text))
+            return result
+
+        self.clock = Clock()
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+        self.inject = FakeInjector()
+        self.s = helpers.settings(fallback=FallbackSettings(mode="home", platform="slack"))
+        self.d = Dispatcher(self.s, self.store, self.inject, own_profile="default", clock=self.clock, inject_home=inject_home)
+        return calls
+
+    def test_event_without_session_goes_to_home_channel(self):
+        calls = self.make_home((True, "slack/C123"))
+        self.d.submit("d1", delivery(event(1, labels={"origin": "hermes"})))
+        self.run_until_idle(10)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "slack")
+        self.assertIn("Summary for the home channel", calls[0][1])
+        self.assertIn("finished its turn", calls[0][1])
+        status, reason = self.store.status_of("evt:ep1:1")
+        self.assertEqual(status, FALLBACK)
+        self.assertIn("sent to home channel slack/C123", reason)
+
+    def test_no_home_channel_is_logged(self):
+        calls = self.make_home((False, "no home channel configured for slack"))
+        with self.assertLogs("hermes_paseo_bridge", "WARNING") as logs:
+            self.d.submit("d1", delivery(event(1, labels={"origin": "hermes"})))
+            self.run_until_idle(10)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(any("no home channel" in m for m in logs.output))
+        self.assertIn("logged (home channel: no home channel", self.store.status_of("evt:ep1:1")[1])
+
+    def test_no_gateway_yet_retries(self):
+        calls = self.make_home((None, "no live Hermes gateway"))
+        self.d.submit("d1", delivery(event(1, labels={"origin": "hermes"})))
+        self.run_until_idle(25)
+        self.assertGreater(len(calls), 1)
+        self.assertEqual(self.store.status_of("evt:ep1:1")[0], PENDING)
 
 
 class RestartTest(Base):

@@ -1,9 +1,10 @@
 """Labels that tie a new Paseo agent to the Hermes session that starts it."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
-from typing import Any, Mapping
+from typing import Any
 
 from .config import Settings
 

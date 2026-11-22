@@ -1,15 +1,17 @@
 """Durable bookkeeping in one SQLite file: which deliveries and events were seen (so a retry or a
 second copy never makes a second turn), which events still wait for their turn (so a gateway restart
-inside the coalescing window loses nothing), and old->new session ids after a compaction."""
+inside the coalescing window loses nothing), old->new session ids after a compaction, which session
+last steered an agent, and the long-poll cursor."""
 from __future__ import annotations
 
 import json
 import sqlite3
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS deliveries (
@@ -33,7 +35,20 @@ CREATE TABLE IF NOT EXISTS aliases (
   new_key TEXT NOT NULL,
   at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS routes (
+  agent_id TEXT PRIMARY KEY,
+  session_key TEXT NOT NULL,
+  profile TEXT NOT NULL,
+  at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS kv (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  at REAL NOT NULL
+);
 """
+
+MIN_ROUTE_PREFIX = 6
 
 PENDING = "pending"
 INJECTED = "injected"
@@ -154,6 +169,45 @@ class Store:
                 seen.add(key)
         return key
 
+    # ------------------------------------------------------------------ routes (steering)
+
+    def set_route(self, agent_id: str, session_key: str, profile: str = "", now: float | None = None) -> None:
+        """The session that last steered ``agent_id`` gets its next events (wins over its labels)."""
+        if not agent_id or not session_key:
+            return
+        with self._lock:
+            self._db.execute(
+                "INSERT OR REPLACE INTO routes(agent_id, session_key, profile, at) VALUES (?,?,?,?)",
+                (agent_id, session_key, profile, time.time() if now is None else now),
+            )
+
+    def route(self, agent_id: str) -> tuple[str, str] | None:
+        """(session_key, profile) of the session that last steered the agent, or None.
+
+        paseo-mcp accepts an id prefix in ``paseo_send_message``, so a stored prefix of at least
+        ``MIN_ROUTE_PREFIX`` characters matches the full id in events (the longest, then newest, wins)."""
+        with self._lock:
+            r = self._db.execute("SELECT session_key, profile FROM routes WHERE agent_id=?", (agent_id,)).fetchone()
+            if r is None:
+                r = self._db.execute(
+                    "SELECT session_key, profile FROM routes WHERE length(agent_id) >= ?"
+                    " AND substr(?, 1, length(agent_id)) = agent_id"
+                    " ORDER BY length(agent_id) DESC, at DESC LIMIT 1", (MIN_ROUTE_PREFIX, agent_id),
+                ).fetchone()
+        return (r[0], r[1]) if r else None
+
+    # ------------------------------------------------------------------ key/value (poll cursor)
+
+    def get_value(self, key: str) -> str | None:
+        with self._lock:
+            r = self._db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+        return r[0] if r else None
+
+    def set_value(self, key: str, value: str, now: float | None = None) -> None:
+        with self._lock:
+            self._db.execute("INSERT OR REPLACE INTO kv(key, value, at) VALUES (?,?,?)",
+                             (key, value, time.time() if now is None else now))
+
     # ------------------------------------------------------------------ upkeep
 
     def prune(self, retention_seconds: float, now: float | None = None) -> int:
@@ -163,6 +217,7 @@ class Store:
             n = self._db.execute("DELETE FROM events WHERE status != ? AND received_at < ?", (PENDING, cutoff)).rowcount
             self._db.execute("DELETE FROM deliveries WHERE received_at < ?", (cutoff,))
             self._db.execute("DELETE FROM aliases WHERE at < ?", (cutoff,))
+            self._db.execute("DELETE FROM routes WHERE at < ?", (cutoff,))
         return n
 
     def counts(self) -> dict[str, Any]:

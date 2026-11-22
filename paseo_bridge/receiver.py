@@ -8,8 +8,8 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable, Optional
 
 from . import signature
 from .config import Settings
@@ -101,11 +101,11 @@ class Receiver:
                  status: Callable[[], dict]):
         self.settings = settings
         self._handler = make_handler(settings, dispatcher, secret, status)
-        self._server: Optional[_Server] = None
-        self._thread: Optional[threading.Thread] = None
+        self._server: _Server | None = None
+        self._thread: threading.Thread | None = None
 
     @property
-    def address(self) -> Optional[tuple[str, int]]:
+    def address(self) -> tuple[str, int] | None:
         return self._server.server_address[:2] if self._server else None
 
     def start(self) -> None:

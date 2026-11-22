@@ -14,8 +14,8 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Optional
 
 from . import messages, signature
 from .config import FallbackSettings, Settings
@@ -29,7 +29,12 @@ SESSION_PREFIX = "session:"
 RETRY_LATER_SECONDS = 10.0
 
 # inject(session_key, text) -> (True, "") accepted | (False, reason) refused | (None, reason) try again later
-Injector = Callable[[str, str], "tuple[Optional[bool], str]"]
+Injector = Callable[[str, str], "tuple[bool | None, str]"]
+# inject_home(platform, text) -> like Injector; (False, "no home channel ...") when the profile has none
+HomeInjector = Callable[[str, str], "tuple[bool | None, str]"]
+
+# Event types that never start a turn, whatever event_types says.
+NEVER_DELIVERED = ("agent.turn_started",)
 
 
 def event_key(event: dict, delivery_id: str, index: int) -> str:
@@ -51,21 +56,41 @@ class Fallback:
     """What happens to events that cannot reach the session that started their agent."""
 
     def __init__(self, settings: FallbackSettings, inject: Injector, render: Callable[[list[dict], str], str], *,
-                 getenv: Callable[[str], Optional[str]] = os.environ.get,
-                 post: Optional[Callable[[str, bytes, dict, float], int]] = None):
+                 getenv: Callable[[str], str | None] = os.environ.get,
+                 post: Callable[[str, bytes, dict, float], int] | None = None,
+                 inject_home: HomeInjector | None = None):
         self.settings = settings
         self.inject = inject
         self.render = render
         self.getenv = getenv
         self.post = post or _http_post
+        self.inject_home = inject_home
 
-    def handle(self, items: list[StoredEvent], reason: str) -> "tuple[Optional[bool], str]":
+    def _log(self, items: list[StoredEvent], reason: str, mode: str = "log") -> "tuple[bool | None, str]":
+        agents = sorted({i.agent_id for i in items})
+        summaries = "; ".join(str(i.event.get("summary") or i.event.get("type")) for i in items[:5])
+        log.warning("paseo-bridge fallback (%s): %d event(s) of agent(s) %s not injected: %s. %s",
+                    mode, len(items), ", ".join(agents), reason, summaries)
+        return True, "logged"
+
+    def handle(self, items: list[StoredEvent], reason: str) -> "tuple[bool | None, str]":
         mode = self.settings.mode
         agents = sorted({i.agent_id for i in items})
         if mode == "log":
-            log.warning("paseo-bridge fallback (log): %d event(s) of agent(s) %s not injected: %s",
-                        len(items), ", ".join(agents), reason)
-            return True, "logged"
+            return self._log(items, reason)
+        if mode == "home":
+            if self.inject_home is None:
+                return self._log(items, f"{reason}; no home channel injector", "home")
+            note = f"Summary for the home channel: these agents have no Hermes session to report to ({reason})."
+            ok, why = self.inject_home(self.settings.platform, self.render([i.event for i in items], note))
+            if ok:
+                log.info("paseo-bridge fallback (home): %d event(s) of agent(s) %s sent to the home channel (%s): %s",
+                         len(items), ", ".join(agents), why, reason)
+                return True, f"sent to home channel {why}".strip()
+            if ok is None:
+                return None, why
+            self._log(items, f"{reason}; home channel: {why}", "home")
+            return True, f"logged (home channel: {why})"
         if mode == "session":
             note = f"These agents could not reach the session that started them ({reason})."
             ok, why = self.inject(self.settings.session_key, self.render([i.event for i in items], note))
@@ -80,7 +105,7 @@ class Fallback:
             return False, f"fallback session refused: {why}"
         return self._forward(items, reason)
 
-    def _forward(self, items: list[StoredEvent], reason: str) -> "tuple[Optional[bool], str]":
+    def _forward(self, items: list[StoredEvent], reason: str) -> "tuple[bool | None, str]":
         s = self.settings
         secret = self.getenv(s.secret_env) if s.secret_env else ""
         if s.secret_env and not secret:
@@ -137,38 +162,45 @@ def _http_post(url: str, body: bytes, headers: dict, timeout: float) -> int:
 
 class Dispatcher:
     def __init__(self, settings: Settings, store: Store, inject: Injector, *, own_profile: str = "",
-                 clock: Callable[[], float] = time.time, fallback: Optional[Fallback] = None):
+                 clock: Callable[[], float] = time.time, fallback: Fallback | None = None,
+                 inject_home: HomeInjector | None = None):
         self.settings = settings
         self.store = store
         self.inject = inject
         self.own_profile = own_profile
         self.clock = clock
-        self.fallback = fallback or Fallback(settings.fallback, inject, self._render)
+        self.fallback = fallback or Fallback(settings.fallback, inject, self._render, inject_home=inject_home)
         self._batches: dict[str, Batch] = {}
         self._sent: dict[str, deque] = {}
         self._cond = threading.Condition()
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self._stopping = False
         self._last_prune = 0.0
 
     # ------------------------------------------------------------------ classification
 
-    def classify(self, event: dict) -> "tuple[str, str, Optional[str]]":
+    def classify(self, event: dict) -> "tuple[str, str, str | None]":
         """(status, target, reason) for one event."""
         s = self.settings
         kind = event.get("type")
-        if kind not in s.event_types:
+        if kind in NEVER_DELIVERED or kind not in s.event_types:
             return SKIPPED, "", f"type {kind} not selected"
-        if kind == "agent.turn_ended" and event.get("outcome") not in s.turn_outcomes:
+        if kind == "agent.turn_ended" and (event.get("outcome") or "finished") not in s.turn_outcomes:
             return SKIPPED, "", f"outcome {event.get('outcome')} not selected"
         labels = event.get("labels") or {}
-        for name, value in s.filter_labels.items():
-            if labels.get(name) != value:
-                return SKIPPED, "", f"label {name}={labels.get(name)!r} does not match {value!r}"
-        key = labels.get(s.session_key_label)
+        agent_id = str(event.get("agentId") or "")
+        route = self.store.route(agent_id) if agent_id else None
+        if route is not None:
+            # A Hermes session steered this agent (paseo_send_message): it waits for the answer.
+            key, profile = route
+        else:
+            for name, value in s.filter_labels.items():
+                if labels.get(name) != value:
+                    return SKIPPED, "", f"label {name}={labels.get(name)!r} does not match {value!r}"
+            key = labels.get(s.session_key_label)
+            profile = labels.get(s.profile_label)
         if not key:
             return PENDING, FALLBACK_TARGET, f"agent has no {s.session_key_label} label"
-        profile = labels.get(s.profile_label)
         if profile and self.own_profile and profile != self.own_profile:
             return PENDING, FALLBACK_TARGET, f"agent belongs to Hermes profile {profile}, this is {self.own_profile}"
         return PENDING, SESSION_PREFIX + key, None
@@ -217,7 +249,7 @@ class Dispatcher:
             log.info("paseo-bridge: restored %d pending event(s)", len(items))
         return len(items)
 
-    def _enqueue(self, event_id: str, target: str, reason: str, at: Optional[float] = None) -> None:
+    def _enqueue(self, event_id: str, target: str, reason: str, at: float | None = None) -> None:
         now = self.clock() if at is None else at
         window = self.settings.coalesce_seconds
         with self._cond:

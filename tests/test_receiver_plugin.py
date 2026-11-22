@@ -6,7 +6,8 @@ import urllib.request
 from unittest import mock
 
 import helpers
-from helpers import FakeInjector, delivery, event
+from helpers import FakeInjector, delivery, event  # noqa: F401
+
 from paseo_bridge import plugin, signature
 from paseo_bridge.dispatcher import Dispatcher
 from paseo_bridge.labels import SessionRef
@@ -105,8 +106,34 @@ class FakeCtx:
         self.unload.append(fn)
 
     def inject_message(self, content, role="user", *, session_key=None, origin=None):
-        self.injected.append((session_key, content))
+        self.injected.append((session_key if origin is None else origin, content))
         return self.accept
+
+
+class PollWiringTest(unittest.TestCase):
+    def test_register_polls_paseo_mcp_and_injects(self):
+        from fake_paseo_mcp import FakePaseoMcp
+        fake = FakePaseoMcp("tok-1234567890")
+        self.addCleanup(fake.close)
+        ctx = FakeCtx(config={"paseo_mcp_url": fake.url, "poll_timeout_seconds": 1, "coalesce_seconds": 0})
+        env = {"HERMES_PASEO_BRIDGE_PASEO_MCP_TOKEN": "tok-1234567890", "HERMES_PASEO_BRIDGE_SECRET": ""}
+        with mock.patch.dict("os.environ", env), \
+                mock.patch.object(plugin, "_data_dir", return_value=__import__("pathlib").Path(__import__("tempfile").mkdtemp())):
+            plugin.register(ctx)
+            self.addCleanup(lambda: [fn() for fn in ctx.unload])
+            for _ in range(60):
+                if fake.calls:
+                    break
+                time.sleep(0.05)
+            fake.emit(event(0))
+            for _ in range(100):
+                if ctx.injected:
+                    break
+                time.sleep(0.05)
+        self.assertEqual(ctx.injected[0][0], "agent:main:slack:dm:T1:D1:1.0")
+        status = ctx.commands["paseo-bridge"]("")
+        self.assertIn("long-poll only", status)
+        self.assertIn("Long-poll: polling", status)
 
 
 class PluginTest(unittest.TestCase):
@@ -129,6 +156,39 @@ class PluginTest(unittest.TestCase):
             self.assertIsNone(b.on_pre_tool_call("terminal", {"command": "ls"}))
         with mock.patch.object(plugin, "current_session", return_value=SessionRef(session_key="")):
             self.assertIsNone(b.on_pre_tool_call("mcp__paseo__paseo_create_agent", {}))
+
+    def test_pre_tool_call_steer_records_route(self):
+        ctx, b = self.bridge()
+        ref = SessionRef(session_key="agent:main:local:dm:ui-2", profile="default", session_id="s2")
+        with mock.patch.object(plugin, "current_session", return_value=ref):
+            out = b.on_pre_tool_call("mcp__paseo__paseo_send_message", {"agent_id": "agent-7", "text": "go on"})
+        self.assertIsNone(out)  # the call itself is not changed
+        self.assertEqual(b.store.route("agent-7"), ("agent:main:local:dm:ui-2", "default"))
+        with mock.patch.object(plugin, "current_session", return_value=SessionRef(session_key="")):
+            b.on_pre_tool_call("mcp__paseo__paseo_send_message", {"agent_id": "agent-8", "text": "x"})
+        self.assertIsNone(b.store.route("agent-8"))
+
+    def test_home_channel_injection(self):
+        import enum
+        from types import SimpleNamespace
+
+        class Platform(enum.Enum):
+            TELEGRAM = "telegram"
+            SLACK = "slack"
+
+        ctx, b = self.bridge()
+        runner = ctx._manager._gateway_message_injector[0]
+        runner.config = SimpleNamespace(platforms={
+            Platform.TELEGRAM: SimpleNamespace(enabled=True, home_channel=None),
+            Platform.SLACK: SimpleNamespace(enabled=True, home_channel=SimpleNamespace(chat_id="C1", thread_id="9.1")),
+        })
+        self.assertEqual(b.inject_home("", "hello"), (True, "slack/C1"))
+        self.assertEqual(ctx.injected[-1][0], {"platform": "slack", "chat_id": "C1", "thread_id": "9.1"})
+        ok, why = b.inject_home("telegram", "hello")
+        self.assertFalse(ok)
+        self.assertIn("no home channel configured for telegram", why)
+        ctx._manager.has_gateway_message_injector = False
+        self.assertIsNone(b.inject_home("", "hello")[0])
 
     def test_current_session_reads_hermes_session_env(self):
         env = {"HERMES_SESSION_KEY": "agent:main:slack:dm:T:D:1", "HERMES_SESSION_ID": "sid",
