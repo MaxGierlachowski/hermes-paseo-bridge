@@ -1,0 +1,33 @@
+[project]
+name = "hermes-paseo-bridge"
+version = "0.1.0"
+description = "Hermes plugin: Paseo agent events continue the Hermes session that started the agent"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Max Gierlachowski" }]
+requires-python = ">=3.11"
+# Runs inside Hermes and uses only the standard library.
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8.3", "ruff>=0.8"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 130
+target-version = "py311"
+extend-exclude = ["docs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["UP037"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]

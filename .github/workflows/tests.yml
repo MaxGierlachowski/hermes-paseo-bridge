@@ -10,13 +10,22 @@ permissions:
 
 jobs:
   unit:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
-        python: ["3.11", "3.12", "3.13"]
+        python: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-      - run: python -m unittest discover -s tests -t tests -v
+      - uses: astral-sh/setup-uv@v6
+      - run: uv python install ${{ matrix.python }}
+      - run: uv run --python ${{ matrix.python }} --group dev ruff check .
+      - run: uv run --python ${{ matrix.python }} --group dev pytest
+      - run: ./scripts/release-tarball.sh
+
+  e2e-hermes:
+    # Real Hermes v0.23.3 + this plugin in an Ubuntu 24.04 container, no LLM (mock model, fake paseo MCP).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: e2e/run-s5.sh
